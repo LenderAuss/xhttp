@@ -24,7 +24,8 @@ echo "uuid: $(xray uuid)" >> /usr/local/etc/xray/.keys
 xray x25519 >> /usr/local/etc/xray/.keys
 
 export uuid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/uuid/ {print $2}')
-export privatkey=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/PrivateKey/ {print $2}')
+export privatkey=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Private key/ {print $2}')
+export publickey=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Public key/ {print $2}')
 export shortsid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
 
 # Получаем дату создания для main пользователя
@@ -69,21 +70,18 @@ cat << EOF > /usr/local/etc/xray/config.json
             "streamSettings": {
                 "network": "xhttp",
                 "xhttpSettings": {
-                    "path": "/xray"
+                    "mode": "auto"
                 },
                 "security": "reality",
                 "realitySettings": {
                     "show": false,
-                    "dest": "microsoft.com:443",
+                    "dest": "www.google.com:443",
                     "xver": 0,
                     "serverNames": [
-                        "microsoft.com",
-                        "www.microsoft.com"
+                        "www.google.com",
+                        "google.com"
                     ],
                     "privateKey": "$privatkey",
-                    "minClientVer": "",
-                    "maxClientVer": "",
-                    "maxTimeDiff": 0,
                     "shortIds": [
                         "$shortsid"
                     ]
@@ -154,16 +152,13 @@ cat << 'SCRIPT' > /usr/local/bin/mainuser
 protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
 port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
 uuid=$(jq -r '.inbounds[0].settings.clients[0].id' /usr/local/etc/xray/config.json)
-pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Password/ {print $2}')
+pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Public key/ {print $2}')
 sid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
 sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
-path=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' /usr/local/etc/xray/config.json)
 ip=$(timeout 3 curl -4 -s icanhazip.com)
 
-# URL-encode path
-encoded_path=$(echo "$path" | sed 's|/|%2F|g')
-
-link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid&type=xhttp&path=$encoded_path&encryption=none#main"
+# XHTTP Reality link format
+link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid&type=xhttp&encryption=none#main"
 echo ""
 echo "Ссылка для подключения:"
 echo "$link"
@@ -207,7 +202,7 @@ uuid=$(xray uuid)
 # Получаем текущую дату и время
 creation_date=$(date '+%Y-%m-%d %H:%M:%S')
 
-# Добавляем нового клиента (без flow для XHTTP)
+# Добавляем нового клиента (БЕЗ flow для XHTTP!)
 jq --arg email "$email" \
    --arg uuid "$uuid" \
    --arg subscription "$subscription" \
@@ -226,16 +221,12 @@ systemctl restart xray
 # Генерируем ссылку (XHTTP формат)
 protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
 port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
-pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Password/ {print $2}')
+pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Public key/ {print $2}')
 sid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
 sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
-path=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' /usr/local/etc/xray/config.json)
 ip=$(curl -4 -s icanhazip.com)
 
-# URL-encode path
-encoded_path=$(echo "$path" | sed 's|/|%2F|g')
-
-link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid&type=xhttp&path=$encoded_path&encryption=none#$email"
+link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid&type=xhttp&encryption=none#$email"
 
 echo ""
 echo "✅ Пользователь создан!"
@@ -357,17 +348,13 @@ fi
 protocol=$(jq -r '.inbounds[0].protocol' "$CONFIG_FILE")
 port=$(jq -r '.inbounds[0].port' "$CONFIG_FILE")
 uuid=$(jq -r --arg email "$selected_email" '.inbounds[0].settings.clients[] | select(.email == $email) | .id' "$CONFIG_FILE")
-pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Password/ {print $2}')
+pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Public key/ {print $2}')
 sid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
 sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$CONFIG_FILE")
-path=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$CONFIG_FILE")
 ip=$(curl -4 -s icanhazip.com)
 
-# URL-encode path
-encoded_path=$(echo "$path" | sed 's|/|%2F|g')
-
 # Формируем ссылку (XHTTP, без flow)
-link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid&type=xhttp&path=$encoded_path&encryption=none#$selected_email"
+link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid&type=xhttp&encryption=none#$selected_email"
 
 echo ""
 echo "✅ Пользователь найден: $selected_email"
@@ -414,7 +401,7 @@ echo "======================================================"
 echo "UUID: $(echo "$client_info" | jq -r '.id')"
 echo "Подписка: $(echo "$client_info" | jq -r '.metadata.subscription // "n/a"')"
 echo "Дата создания: $(echo "$client_info" | jq -r '.metadata.created_date // "n/a"')"
-echo "Транспорт: XHTTP"
+echo "Транспорт: XHTTP + Reality"
 echo "======================================================"
 SCRIPT
 chmod +x /usr/local/bin/userinfo
@@ -471,7 +458,11 @@ chmod +x /usr/local/bin/togglesub
 
 systemctl restart xray
 
+echo ""
+echo "=========================================="
 echo "Xray-core успешно установлен (XHTTP + Reality)"
+echo "=========================================="
+echo ""
 mainuser
 
 # Создаем файл с подсказками
@@ -488,15 +479,15 @@ cat << 'EOF' > $HOME/help
     togglesub - переключает статус подписки пользователя (y/n)
 
 Особенности XHTTP + Reality:
-    • Транспорт: XHTTP (современная замена TCP+Vision)
-    • Безопасность: Reality (имитация microsoft.com)
+    • Транспорт: XHTTP (mode: auto)
+    • Безопасность: Reality (имитация www.google.com)
     • Все пользователи на одном порту 443
     • Общие ключи Reality для всех (безопасно!)
     • Уникальный UUID для каждого
     • БЕЗ flow (не нужен для XHTTP)
 
 Формат ссылки:
-    vless://UUID@IP:443?security=reality&sni=microsoft.com&fp=chrome&pbk=XXX&sid=XXX&type=xhttp&path=%2Fxray
+    vless://UUID@IP:443?security=reality&sni=www.google.com&fp=chrome&pbk=XXX&sid=XXX&type=xhttp&encryption=none#username
 
 Файл конфигурации:
     /usr/local/etc/xray/config.json
@@ -505,8 +496,8 @@ cat << 'EOF' > $HOME/help
     /usr/local/etc/xray/.keys
     
 Формат ключей xray x25519:
-    PrivateKey - приватный ключ для сервера (в config.json)
-    Password - публичный ключ для клиента (pbk в ссылке)
+    Private key - приватный ключ для сервера (в config.json)
+    Public key - публичный ключ для клиента (pbk в ссылке)
 
 Команды:
     systemctl restart xray          # перезагрузка

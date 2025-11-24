@@ -1,0 +1,522 @@
+#!/bin/bash
+apt update
+apt install qrencode curl jq bc -y
+
+# Включаем bbr
+bbr=$(sysctl -a | grep net.ipv4.tcp_congestion_control)
+if [ "$bbr" = "net.ipv4.tcp_congestion_control = bbr" ]; then
+    echo "bbr уже включен"
+else
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    sysctl -p
+    echo "bbr включен"
+fi
+
+# Устанавливаем ядро Xray
+bash -c "$(curl -4 -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+
+# Генерируем ключи
+[ -f /usr/local/etc/xray/.keys ] && rm /usr/local/etc/xray/.keys
+touch /usr/local/etc/xray/.keys
+echo "shortsid: $(openssl rand -hex 8)" >> /usr/local/etc/xray/.keys
+echo "uuid: $(xray uuid)" >> /usr/local/etc/xray/.keys
+xray x25519 >> /usr/local/etc/xray/.keys
+
+export uuid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/uuid/ {print $2}')
+# Универсальный парсинг: поддержка обоих форматов вывода xray x25519
+# Старый формат: "Private key:" / "Public key:"
+# Новый формат: "PrivateKey:" / "Password:"
+export privatkey=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/PrivateKey|Private key/ {print $2; exit}')
+export publickey=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Password|Public key/ {print $2; exit}')
+export shortsid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
+
+# Получаем дату создания для main пользователя
+main_creation_date=$(date '+%Y-%m-%d %H:%M:%S')
+
+# Создаем файл конфигурации Xray (XHTTP + Reality)
+# Источник: https://gozargah.github.io/marzban/en/docs/xray-inbounds
+cat << EOF > /usr/local/etc/xray/config.json
+{
+    "log": {
+        "loglevel": "warning"
+    },
+    "routing": {
+        "domainStrategy": "IPIfNonMatch",
+        "rules": [
+            {
+                "type": "field",
+                "domain": [
+                    "geosite:category-ads-all"
+                ],
+                "outboundTag": "block"
+            }
+        ]
+    },
+    "inbounds": [
+        {
+            "listen": "0.0.0.0",
+            "port": 443,
+            "protocol": "vless",
+            "settings": {
+                "clients": [
+                    {
+                        "email": "main",
+                        "id": "$uuid",
+                        "metadata": {
+                            "subscription": "y",
+                            "created_date": "$main_creation_date"
+                        }
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "xhttpSettings": {
+                    "mode": "auto"
+                },
+                "security": "reality",
+                "realitySettings": {
+                    "show": false,
+                    "dest": "www.google.com:443",
+                    "xver": 0,
+                    "serverNames": [
+                        "www.google.com",
+                        "google.com"
+                    ],
+                    "privateKey": "$privatkey",
+                    "shortIds": [
+                        "$shortsid"
+                    ]
+                }
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": [
+                    "http",
+                    "tls",
+                    "quic"
+                ]
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "protocol": "freedom",
+            "tag": "direct"
+        },
+        {
+            "protocol": "blackhole",
+            "tag": "block"
+        }
+    ],
+    "policy": {
+        "levels": {
+            "0": {
+                "handshake": 3,
+                "connIdle": 180
+            }
+        }
+    }
+}
+EOF
+
+# Исполняемый файл для списка клиентов
+cat << 'SCRIPT' > /usr/local/bin/userlist
+#!/bin/bash
+clients=$(jq -c '.inbounds[0].settings.clients[]' /usr/local/etc/xray/config.json)
+
+if [[ -z "$clients" ]]; then
+    echo "Список клиентов пуст"
+    exit 1
+fi
+
+echo "======================================================"
+echo "Список клиентов:"
+echo "======================================================"
+i=1
+while IFS= read -r client; do
+    email=$(echo "$client" | jq -r '.email')
+    subscription=$(echo "$client" | jq -r '.metadata.subscription // "n/a"')
+    created_date=$(echo "$client" | jq -r '.metadata.created_date // "n/a"')
+    
+    echo "$i. $email"
+    echo "   Подписка: $subscription"
+    echo "   Создан: $created_date"
+    echo "------------------------------------------------------"
+    ((i++))
+done <<< "$clients"
+SCRIPT
+chmod +x /usr/local/bin/userlist
+
+# Исполняемый файл для ссылки основного пользователя (XHTTP)
+cat << 'SCRIPT' > /usr/local/bin/mainuser
+#!/bin/bash
+protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
+port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
+uuid=$(jq -r '.inbounds[0].settings.clients[0].id' /usr/local/etc/xray/config.json)
+pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Password|Public key/ {print $2; exit}')
+sid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
+sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
+ip=$(timeout 3 curl -4 -s icanhazip.com)
+
+# XHTTP Reality link format
+link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid&type=xhttp&encryption=none#main"
+echo ""
+echo "Ссылка для подключения:"
+echo "$link"
+echo ""
+echo "QR-код:"
+echo ${link} | qrencode -t ansiutf8
+SCRIPT
+chmod +x /usr/local/bin/mainuser
+
+# Исполняемый файл для создания новых клиентов (XHTTP)
+cat << 'SCRIPT' > /usr/local/bin/newuser
+#!/bin/bash
+read -p "Введите имя пользователя: " email
+
+if [[ -z "$email" || "$email" == *" "* ]]; then
+    echo "Имя пользователя не может быть пустым или содержать пробелы. Попробуйте снова."
+    exit 1
+fi
+
+# Проверяем существование пользователя
+existing_user=$(jq --arg email "$email" '.inbounds[0].settings.clients[] | select(.email == $email)' /usr/local/etc/xray/config.json)
+if [[ -n "$existing_user" ]]; then
+    echo "Пользователь с таким именем уже существует. Попробуйте снова."
+    exit 1
+fi
+
+# Запрашиваем тип подписки
+while true; do
+    read -p "Подписка активна? (y/n): " subscription
+    subscription=$(echo "$subscription" | tr '[:upper:]' '[:lower:]')
+    if [[ "$subscription" == "y" || "$subscription" == "n" ]]; then
+        break
+    else
+        echo "Ошибка: введите 'y' (да) или 'n' (нет)"
+    fi
+done
+
+# Генерируем новый UUID
+uuid=$(xray uuid)
+
+# Получаем текущую дату и время
+creation_date=$(date '+%Y-%m-%d %H:%M:%S')
+
+# Добавляем нового клиента (БЕЗ flow для XHTTP!)
+jq --arg email "$email" \
+   --arg uuid "$uuid" \
+   --arg subscription "$subscription" \
+   --arg created_date "$creation_date" \
+   '.inbounds[0].settings.clients += [{
+       "email": $email,
+       "id": $uuid,
+       "metadata": {
+           "subscription": $subscription,
+           "created_date": $created_date
+       }
+   }]' /usr/local/etc/xray/config.json > tmp.json && mv tmp.json /usr/local/etc/xray/config.json
+
+systemctl restart xray
+
+# Генерируем ссылку (XHTTP формат)
+protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
+port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
+pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Password|Public key/ {print $2; exit}')
+sid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
+sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
+ip=$(curl -4 -s icanhazip.com)
+
+link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid&type=xhttp&encryption=none#$email"
+
+echo ""
+echo "✅ Пользователь создан!"
+echo "   Имя: $email"
+echo "   Подписка: $subscription"
+echo "   Дата создания: $creation_date"
+echo ""
+echo "Ссылка для подключения:"
+echo "$link"
+echo ""
+echo "QR-код:"
+echo ${link} | qrencode -t ansiutf8
+SCRIPT
+chmod +x /usr/local/bin/newuser
+
+# Исполняемый файл для удаления клиентов (ПО ИМЕНИ!)
+cat << 'SCRIPT' > /usr/local/bin/rmuser
+#!/bin/bash
+CONFIG_FILE="/usr/local/etc/xray/config.json"
+
+# Получаем список email
+emails=($(jq -r '.inbounds[0].settings.clients[].email' "$CONFIG_FILE"))
+
+if [[ ${#emails[@]} -eq 0 ]]; then
+    echo "Нет клиентов для удаления."
+    exit 1
+fi
+
+echo "Список клиентов:"
+for i in "${!emails[@]}"; do
+    email="${emails[$i]}"
+    subscription=$(jq -r --arg email "$email" '.inbounds[0].settings.clients[] | select(.email == $email) | .metadata.subscription // "n/a"' "$CONFIG_FILE")
+    echo "$((i+1)). $email (подписка: $subscription)"
+done
+echo "======================================================"
+echo ""
+
+# Запрашиваем имя пользователя
+read -p "Введите имя пользователя для удаления: " selected_email
+
+# Проверяем, что имя не пустое
+if [[ -z "$selected_email" ]]; then
+    echo "❌ Ошибка: имя не может быть пустым"
+    exit 1
+fi
+
+# Проверяем, что это не main
+if [[ "$selected_email" == "main" ]]; then
+    echo "❌ Ошибка: нельзя удалить основного пользователя"
+    exit 1
+fi
+
+# Проверяем существование пользователя
+user_exists=$(jq -r --arg email "$selected_email" '.inbounds[0].settings.clients[] | select(.email == $email) | .email' "$CONFIG_FILE")
+
+if [[ -z "$user_exists" ]]; then
+    echo "❌ Ошибка: пользователь '$selected_email' не найден"
+    exit 1
+fi
+
+# Подтверждение
+read -p "Вы уверены, что хотите удалить пользователя '$selected_email'? (y/n): " confirm
+if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    echo "Отменено"
+    exit 0
+fi
+
+# Удаляем пользователя по email
+jq --arg email "$selected_email" \
+   '.inbounds[0].settings.clients = [.inbounds[0].settings.clients[] | select(.email != $email)]' \
+   "$CONFIG_FILE" > tmp.json && mv tmp.json "$CONFIG_FILE"
+
+systemctl restart xray
+
+echo "✅ Пользователь '$selected_email' удален"
+SCRIPT
+chmod +x /usr/local/bin/rmuser
+
+# Исполняемый файл для получения ссылки существующего пользователя (XHTTP)
+cat << 'SCRIPT' > /usr/local/bin/sharelink
+#!/bin/bash
+CONFIG_FILE="/usr/local/etc/xray/config.json"
+
+# Получаем список email
+emails=($(jq -r '.inbounds[0].settings.clients[].email' "$CONFIG_FILE"))
+
+if [[ ${#emails[@]} -eq 0 ]]; then
+    echo "Список клиентов пуст"
+    exit 1
+fi
+
+echo "Список клиентов:"
+for i in "${!emails[@]}"; do
+    email="${emails[$i]}"
+    subscription=$(jq -r --arg email "$email" '.inbounds[0].settings.clients[] | select(.email == $email) | .metadata.subscription // "n/a"' "$CONFIG_FILE")
+    echo "$((i+1)). $email (подписка: $subscription)"
+done
+echo "======================================================"
+echo ""
+
+# Запрашиваем имя пользователя
+read -p "Введите имя пользователя: " selected_email
+
+# Проверяем, что имя не пустое
+if [[ -z "$selected_email" ]]; then
+    echo "❌ Ошибка: имя не может быть пустым"
+    exit 1
+fi
+
+# Проверяем существование пользователя
+user_exists=$(jq -r --arg email "$selected_email" '.inbounds[0].settings.clients[] | select(.email == $email) | .email' "$CONFIG_FILE")
+
+if [[ -z "$user_exists" ]]; then
+    echo "❌ Ошибка: пользователь '$selected_email' не найден"
+    exit 1
+fi
+
+# Получаем данные пользователя (XHTTP формат)
+protocol=$(jq -r '.inbounds[0].protocol' "$CONFIG_FILE")
+port=$(jq -r '.inbounds[0].port' "$CONFIG_FILE")
+uuid=$(jq -r --arg email "$selected_email" '.inbounds[0].settings.clients[] | select(.email == $email) | .id' "$CONFIG_FILE")
+pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Password|Public key/ {print $2; exit}')
+sid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
+sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$CONFIG_FILE")
+ip=$(curl -4 -s icanhazip.com)
+
+# Формируем ссылку (XHTTP, без flow)
+link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid&type=xhttp&encryption=none#$selected_email"
+
+echo ""
+echo "✅ Пользователь найден: $selected_email"
+echo ""
+echo "Ссылка для подключения:"
+echo "$link"
+echo ""
+echo "QR-код:"
+echo ${link} | qrencode -t ansiutf8
+SCRIPT
+chmod +x /usr/local/bin/sharelink
+
+# Новая команда для просмотра детальной информации о пользователе
+cat << 'SCRIPT' > /usr/local/bin/userinfo
+#!/bin/bash
+emails=($(jq -r '.inbounds[0].settings.clients[].email' /usr/local/etc/xray/config.json))
+
+if [[ ${#emails[@]} -eq 0 ]]; then
+    echo "Список клиентов пуст"
+    exit 1
+fi
+
+echo "Список клиентов:"
+for i in "${!emails[@]}"; do
+    echo "$((i+1)). ${emails[$i]}"
+done
+
+read -p "Выберите номер клиента для просмотра информации: " client
+
+if ! [[ "$client" =~ ^[0-9]+$ ]] || (( client < 1 || client > ${#emails[@]} )); then
+    echo "Ошибка: номер должен быть от 1 до ${#emails[@]}"
+    exit 1
+fi
+
+selected_email="${emails[$((client - 1))]}"
+
+# Получаем информацию о клиенте
+client_info=$(jq --arg email "$selected_email" '.inbounds[0].settings.clients[] | select(.email == $email)' /usr/local/etc/xray/config.json)
+
+echo ""
+echo "======================================================"
+echo "Информация о клиенте: $selected_email"
+echo "======================================================"
+echo "UUID: $(echo "$client_info" | jq -r '.id')"
+echo "Подписка: $(echo "$client_info" | jq -r '.metadata.subscription // "n/a"')"
+echo "Дата создания: $(echo "$client_info" | jq -r '.metadata.created_date // "n/a"')"
+echo "Транспорт: XHTTP + Reality"
+echo "======================================================"
+SCRIPT
+chmod +x /usr/local/bin/userinfo
+
+# Команда для переключения подписки
+cat << 'SCRIPT' > /usr/local/bin/togglesub
+#!/bin/bash
+CONFIG_FILE="/usr/local/etc/xray/config.json"
+
+emails=($(jq -r '.inbounds[0].settings.clients[].email' "$CONFIG_FILE"))
+
+if [[ ${#emails[@]} -eq 0 ]]; then
+    echo "Список клиентов пуст"
+    exit 1
+fi
+
+echo "Список клиентов:"
+for i in "${!emails[@]}"; do
+    email="${emails[$i]}"
+    subscription=$(jq -r --arg email "$email" '.inbounds[0].settings.clients[] | select(.email == $email) | .metadata.subscription // "n/a"' "$CONFIG_FILE")
+    echo "$((i+1)). $email (подписка: $subscription)"
+done
+
+read -p "Выберите клиента для изменения подписки: " client
+
+if ! [[ "$client" =~ ^[0-9]+$ ]] || (( client < 1 || client > ${#emails[@]} )); then
+    echo "Ошибка: номер должен быть от 1 до ${#emails[@]}"
+    exit 1
+fi
+
+selected_email="${emails[$((client - 1))]}"
+
+# Получаем текущую подписку
+current_sub=$(jq -r --arg email "$selected_email" '.inbounds[0].settings.clients[] | select(.email == $email) | .metadata.subscription // "n"' "$CONFIG_FILE")
+
+# Переключаем подписку
+if [[ "$current_sub" == "y" ]]; then
+    new_sub="n"
+else
+    new_sub="y"
+fi
+
+# Обновляем конфиг по email
+jq --arg email "$selected_email" --arg new_sub "$new_sub" \
+   '(.inbounds[0].settings.clients[] | select(.email == $email) | .metadata.subscription) = $new_sub' \
+   "$CONFIG_FILE" > tmp.json && mv tmp.json "$CONFIG_FILE"
+
+systemctl restart xray
+
+echo ""
+echo "✅ Подписка пользователя $selected_email изменена: $current_sub → $new_sub"
+SCRIPT
+chmod +x /usr/local/bin/togglesub
+
+systemctl restart xray
+
+echo ""
+echo "=========================================="
+echo "Xray-core успешно установлен (XHTTP + Reality)"
+echo "=========================================="
+echo ""
+mainuser
+
+# Создаем файл с подсказками
+cat << 'EOF' > $HOME/help
+
+Команды для управления пользователями Xray (XHTTP + Reality):
+
+    mainuser - выводит ссылку для подключения основного пользователя
+    newuser - создает нового пользователя (с указанием подписки)
+    rmuser - удаление пользователей ПО ИМЕНИ (безопасно!)
+    sharelink - выводит список пользователей и позволяет создать для них ссылки
+    userlist - выводит список клиентов с подписками и датами создания
+    userinfo - показывает детальную информацию о выбранном пользователе
+    togglesub - переключает статус подписки пользователя (y/n)
+
+Особенности XHTTP + Reality:
+    • Транспорт: XHTTP (mode: auto)
+    • Безопасность: Reality (имитация www.google.com)
+    • Все пользователи на одном порту 443
+    • Общие ключи Reality для всех (безопасно!)
+    • Уникальный UUID для каждого
+    • БЕЗ flow (не нужен для XHTTP)
+
+Формат ссылки:
+    vless://UUID@IP:443?security=reality&sni=www.google.com&fp=chrome&pbk=XXX&sid=XXX&type=xhttp&encryption=none#username
+
+Файл конфигурации:
+    /usr/local/etc/xray/config.json
+
+Ключи Reality:
+    /usr/local/etc/xray/.keys
+    
+Формат ключей xray x25519 (зависит от версии):
+    Новый формат:
+        PrivateKey - приватный ключ для сервера (в config.json)
+        Password - публичный ключ для клиента (pbk в ссылке)
+    Старый формат:
+        Private key - приватный ключ для сервера
+        Public key - публичный ключ для клиента
+
+Команды:
+    systemctl restart xray          # перезагрузка
+    systemctl status xray           # статус
+    journalctl -u xray -f           # логи в реальном времени
+
+Проверка ключей:
+    cat /usr/local/etc/xray/.keys   # просмотр всех ключей
+
+EOF
+
+echo ""
+echo "Справка сохранена в ~/help"
+echo ""
